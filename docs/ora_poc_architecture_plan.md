@@ -130,7 +130,24 @@ poc/ora_fabric/
 | S1 | M1 + M2 (그래프 + 탄성 코어) | Join/Fork/Merge 진리표 테스트 통과, 슬랙 삽입 API 동작 |
 | S2 | M3 (라우터) | 체인드 헤더·VC 승격·논리 시프트 단위 테스트 통과 |
 | S3 | M4 (하네스) | H1/H2/H3 전 항목 통과, `demo_mesh4x4.py` 데드락 0 확인 |
-| S4 | (선택) Chisel/Verilog 타일 레퍼런스 RTL과 co-sim | 시뮬레이터·RTL 플릿 트레이스 정합 |
+| S4 | SpinalHDL 레퍼런스 RTL (`poc/ora_rtl/`) 과 co-sim. Podman 이미지 `localhost/ora-rtl` 내 Verilator 5.020 | 시뮬레이터·RTL 플릿 트레이스 정합 |
 
 S1~S3를 Python으로 완결하는 것이 1차 목표이고, S4는 표준 사양서
 로드맵 2단계(SkyWater 130nm MPW)로 연결되는 관문(Gate)이다.
+
+### S4 진행 현황
+
+실행: `just --justfile poc/ora_rtl/cosim.just cosim-all` (sbt, Verilator, 시뮬레이션 모두 컨테이너 내부).
+
+| 범위 | RTL | 골든 모델 | 결과 |
+|------|-----|-----------|------|
+| 단일 채널 코어 | `OraRouterCore` (입력 1, 출력 1 + eject, 백프레셔) | `NoCRouter` 단일 경로 | 8/8 시나리오 트레이스 일치 |
+| 다중 포트 라우터 × 2 체인 | `OraRouter` (7포트 × 2VC FIFO, (포트, VC) 락, 포트별 RR, 깊이 2) | `NoCRouter` 2개 (R0.EAST ↔ R1.WEST) | 9/9 시나리오 트레이스 일치 |
+
+중재 규칙은 사양서 "웜홀 자원 관리 및 사이클 중재 계약" 절을 따른다. co-sim 시나리오가 실제로 결함을 잡는지 변이(mutation) 검사로 확인했다. RR 우선순위 반전, 하류 크레딧 무시, 헤더 락 검사 제거 세 변이 모두 1개 이상의 시나리오에서 불일치를 냈다.
+
+남은 한계:
+
+- co-sim 토폴로지는 2-라우터 선형 체인뿐이다. 메시(예: 4×4) 규모의 RTL co-sim과 무작위 트래픽 co-sim은 아직 수행하지 않았다.
+- 로컬 배출은 항상 수신 가능(ready)하다고 가정한다. NI 측 배출 백프레셔는 모델링하지 않았다.
+- 합성, 타이밍, 면적은 평가하지 않았다(비목표).
