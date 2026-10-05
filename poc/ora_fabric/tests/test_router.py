@@ -368,3 +368,95 @@ class TestAerSingleFlit:
         assert (received >> 30) == FLIT_TYPE_SINGLE_AER
         assert received & 0xFFFFF == 0xABCDE
         assert ((received >> 26) & 0b11) == 0
+
+
+class TestPerPortRoundRobin:
+    """The RR pointer is per physical output link and is a pure function of
+    buffer state + per-port history, not of global iteration order."""
+
+    @staticmethod
+    def _hdr(vc: int, port: int) -> int:
+        return pack_header_flit(vc_id=vc, hop_count=1, chained=False,
+                                vc_transition_hop=NO_VC_TRANSITION,
+                                direction_vector=[port])
+
+    @staticmethod
+    def _tail(vc: int, data: int) -> int:
+        return (FLIT_TYPE_TAIL << 30) | (vc << 28) | data
+
+    def test_rr_alternates_vc_classes_on_one_link(self):
+        """Two saturated VC classes on one link must strictly alternate."""
+        r0 = NoCRouter(tile_id=0, buffer_depth=16)
+        r1 = NoCRouter(tile_id=1, buffer_depth=64)
+        r0.connect(PORT_EAST, r1, PORT_WEST)
+
+        # VC0 and VC1 each send a long wormhole on the same East link
+        r0.receive_flit(PORT_LOCAL, self._hdr(VC0, PORT_EAST))
+        r0.receive_flit(PORT_NORTH, self._hdr(VC1, PORT_EAST))
+        for i in range(6):
+            r0.receive_flit(PORT_LOCAL, (FLIT_TYPE_BODY << 30) | (VC0 << 28) | i)
+            r0.receive_flit(PORT_NORTH, (FLIT_TYPE_BODY << 30) | (VC1 << 28) | i)
+
+        served = []
+        for _ in range(10):
+            before0 = len(r1.in_buffers[(PORT_WEST, VC0)])
+            before1 = len(r1.in_buffers[(PORT_WEST, VC1)])
+            r0.step()
+            if len(r1.in_buffers[(PORT_WEST, VC0)]) > before0:
+                served.append(VC0)
+            elif len(r1.in_buffers[(PORT_WEST, VC1)]) > before1:
+                served.append(VC1)
+
+        # Fresh link starts with VC1, then strictly alternates
+        assert served[0] == VC1
+        for a, b in zip(served, served[1:]):
+            assert a != b, f"RR did not alternate: {served}"
+
+    def test_rr_pointers_are_independent_per_link(self):
+        """Traffic on the North link must not shift the East link's RR state."""
+        r0 = NoCRouter(tile_id=0, buffer_depth=16)
+        east = NoCRouter(tile_id=1, buffer_depth=64)
+        north = NoCRouter(tile_id=2, buffer_depth=64)
+        r0.connect(PORT_EAST, east, PORT_WEST)
+        r0.connect(PORT_NORTH, north, PORT_SOUTH)
+
+        # Only VC0 uses North for a while: this moves North's pointer only
+        r0.receive_flit(PORT_WEST, self._hdr(VC0, PORT_NORTH))
+        for i in range(3):
+            r0.receive_flit(PORT_WEST, (FLIT_TYPE_BODY << 30) | (VC0 << 28) | i)
+        for _ in range(4):
+            r0.step()
+        assert r0._rr_last_served.get(PORT_NORTH) == VC0
+        assert PORT_EAST not in r0._rr_last_served  # East untouched
+
+        # Now both classes contend for East: a fresh East link must still
+        # give VC1 the first turn, regardless of North's history.
+        r0.receive_flit(PORT_LOCAL, self._hdr(VC0, PORT_EAST))
+        r0.receive_flit(PORT_SOUTH, self._hdr(VC1, PORT_EAST))
+        r0.step()
+        assert len(east.in_buffers[(PORT_WEST, VC1)]) == 1
+        assert len(east.in_buffers[(PORT_WEST, VC0)]) == 0
+
+    def test_arbitration_is_deterministic_across_runs(self):
+        """Identical stimulus must yield identical per-cycle forwarding,
+        proving the order is a function of state, not of dict history."""
+        def run() -> list[tuple[int, int]]:
+            r0 = NoCRouter(tile_id=0, buffer_depth=16)
+            r1 = NoCRouter(tile_id=1, buffer_depth=64)
+            r0.connect(PORT_EAST, r1, PORT_WEST)
+            for port, vc in ((PORT_LOCAL, VC0), (PORT_NORTH, VC1),
+                             (PORT_SOUTH, VC0), (PORT_WEST, VC1)):
+                r0.receive_flit(port, self._hdr(vc, PORT_EAST))
+                r0.receive_flit(port, self._tail(vc, port))
+            trace = []
+            for cyc in range(12):
+                r0.evaluate_cycle()
+                if PORT_EAST in r0.staged_tx:
+                    trace.append((cyc, r0.staged_tx[PORT_EAST][2]))
+                r0.commit_cycle()
+            return trace
+
+        first = run()
+        assert len(first) == 8  # 4 packets x (header + tail)
+        for _ in range(5):
+            assert run() == first
