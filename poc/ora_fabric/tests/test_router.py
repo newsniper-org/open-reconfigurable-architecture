@@ -243,9 +243,16 @@ class TestVirtualChannelIndependence:
         remaining = len(r0.in_buffers[(PORT_SOUTH, VC0)])
         assert remaining == 2  # hdr_b0 + tail_b still waiting
 
-        # Cycle 2: packet A's tail streams through and releases the lock; in the
-        # same cycle, B (on a later port in the iteration order) acquires the
-        # freed (PORT_LOCAL, VC0) lock and ejects its header.
+        # Cycle 2: packet A's tail streams through and releases the lock.
+        # Release->grant contract: a lock freed this cycle is re-grantable
+        # only next cycle (decisions use start-of-cycle lock state), so B
+        # still waits.
+        r0.step()
+        assert (PORT_LOCAL, VC0) not in r0.crossbar_locks
+        assert len(r0.ejection_queue) == 2  # A.hdr, A.tail
+        assert len(r0.in_buffers[(PORT_SOUTH, VC0)]) == 2
+
+        # Cycle 3: B acquires the freed (PORT_LOCAL, VC0) lock and ejects its header
         r0.step()
         assert (PORT_LOCAL, VC0) in r0.crossbar_locks
         assert r0.crossbar_locks[(PORT_LOCAL, VC0)].in_port == PORT_SOUTH  # now B's lock
@@ -257,7 +264,7 @@ class TestVirtualChannelIndependence:
         assert ejected_payloads[1] == 0xAA  # A's tail payload
         assert ejected_types[2] == FLIT_TYPE_HEADER  # B's header flit
 
-        # Cycle 3: packet B's tail streams through and fully releases the lock
+        # Cycle 4: packet B's tail streams through and fully releases the lock
         r0.step()
         assert (PORT_LOCAL, VC0) not in r0.crossbar_locks
         assert len(r0.ejection_queue) == 4  # A.hdr, A.tail, B.hdr, B.tail
@@ -460,3 +467,98 @@ class TestPerPortRoundRobin:
         assert len(first) == 8  # 4 packets x (header + tail)
         for _ in range(5):
             assert run() == first
+
+
+class TestStartOfCycleContract:
+    """Decisions depend only on start-of-cycle state (RTL-implementable)."""
+
+    @staticmethod
+    def _build(order_reversed: bool):
+        # 3-router line r0 -E-> r1 -E-> r2 with shallow buffers. r1 also
+        # injects its own VC1 stream onto its East link, so that link runs at
+        # half rate per class and r1's West buffer fills: credit decisions
+        # then depend on whether r1 popped before r0 looked.
+        rs = [NoCRouter(tile_id=i, buffer_depth=2) for i in range(3)]
+        rs[0].connect(PORT_EAST, rs[1], PORT_WEST)
+        rs[1].connect(PORT_EAST, rs[2], PORT_WEST)
+        hdr0 = pack_header_flit(vc_id=VC0, hop_count=2, chained=False,
+                                vc_transition_hop=NO_VC_TRANSITION,
+                                direction_vector=[PORT_EAST, PORT_EAST])
+        stim0 = [hdr0] + [(FLIT_TYPE_BODY << 30) | i for i in range(6)] + [(FLIT_TYPE_TAIL << 30) | 0x77]
+        hdr1 = pack_header_flit(vc_id=VC1, hop_count=1, chained=False,
+                                vc_transition_hop=NO_VC_TRANSITION,
+                                direction_vector=[PORT_EAST])
+        stim1 = ([hdr1] + [(FLIT_TYPE_BODY << 30) | (VC1 << 28) | (0x100 + i) for i in range(6)]
+                 + [(FLIT_TYPE_TAIL << 30) | (VC1 << 28) | 0x1FF])
+        net = NoCNetwork(list(reversed(rs)) if order_reversed else rs)
+        return rs, net, stim0, stim1
+
+    def test_network_result_independent_of_router_order(self):
+        traces = []
+        stalls = []
+        for rev in (False, True):
+            rs, net, stim0, stim1 = self._build(rev)
+            pend0, pend1 = list(stim0), list(stim1)
+            ejected: list[tuple[int, int]] = []
+            state: list[tuple[tuple[int, ...], ...]] = []
+            r1_full_cycles = 0
+            for cyc in range(60):
+                inj0 = pend0.pop(0) if pend0 and rs[0].can_receive(PORT_LOCAL, VC0) else None
+                inj1 = pend1.pop(0) if pend1 and rs[1].can_receive(PORT_LOCAL, VC1) else None
+                if not rs[1].can_receive(PORT_WEST, VC0):
+                    r1_full_cycles += 1
+                net.step()
+                if inj0 is not None:
+                    rs[0].receive_flit(PORT_LOCAL, inj0)
+                if inj1 is not None:
+                    rs[1].receive_flit(PORT_LOCAL, inj1)
+                while rs[2].ejection_queue:
+                    ejected.append((cyc, rs[2].ejection_queue.popleft()))
+                # Full per-cycle state, not just ejections: internal timing
+                # differences can be masked by a downstream bottleneck.
+                state.append(tuple(
+                    tuple(len(r.in_buffers[k]) for k in sorted(r.in_buffers)) for r in rs
+                ))
+            traces.append((ejected, state))
+            stalls.append(r1_full_cycles)
+        assert len(traces[0][0]) == 16
+        assert stalls[0] > 0, "scenario must exercise backpressure"
+        assert traces[0][0] == traces[1][0], "ejection timing depends on router order"
+        assert traces[0][1] == traces[1][1], "buffer state depends on router order"
+
+    def test_at_most_one_eject_per_cycle(self):
+        r0 = NoCRouter(tile_id=0)
+        for port in (PORT_NORTH, PORT_SOUTH, PORT_WEST):
+            r0.receive_flit(port, pack_single_flit_aer(
+                hop_count=0, direction_vector=[], neuron_address=port))
+        counts = []
+        for _ in range(4):
+            before = len(r0.ejection_queue)
+            r0.step()
+            counts.append(len(r0.ejection_queue) - before)
+        assert counts == [1, 1, 1, 0]
+
+    def test_ni_reassembles_interleaved_vc_wormholes(self):
+        r0 = NoCRouter(tile_id=0, buffer_depth=8)
+        ni = NetworkInterface(tile_id=0, router=r0)
+        h0 = pack_header_flit(vc_id=VC0, hop_count=0, chained=False,
+                              vc_transition_hop=NO_VC_TRANSITION, direction_vector=[])
+        h1 = pack_header_flit(vc_id=VC1, hop_count=0, chained=False,
+                              vc_transition_hop=NO_VC_TRANSITION, direction_vector=[])
+        r0.receive_flit(PORT_NORTH, h0)
+        r0.receive_flit(PORT_NORTH, (FLIT_TYPE_BODY << 30) | (VC0 << 28) | 0xA0)
+        r0.receive_flit(PORT_NORTH, (FLIT_TYPE_TAIL << 30) | (VC0 << 28) | 0xA1)
+        r0.receive_flit(PORT_SOUTH, h1)
+        r0.receive_flit(PORT_SOUTH, (FLIT_TYPE_BODY << 30) | (VC1 << 28) | 0xB0)
+        r0.receive_flit(PORT_SOUTH, (FLIT_TYPE_TAIL << 30) | (VC1 << 28) | 0xB1)
+
+        vcs_seen = []
+        for _ in range(8):
+            before = len(r0.ejection_queue)
+            r0.step()
+            vcs_seen += [(f >> 28) & 0b11 for f in list(r0.ejection_queue)[before:]]
+            ni.step()
+        # The single eject port alternated between VC classes (per-port RR)
+        assert vcs_seen[:4] == [VC1, VC0, VC1, VC0]
+        payloads = sorted(tuple(p.payload) for p in ni.rx_packets)
+        assert payloads == [(0xA0, 0xA1), (0xB0, 0xB1)]

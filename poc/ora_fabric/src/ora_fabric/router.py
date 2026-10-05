@@ -103,6 +103,19 @@ class NoCRouter:
         # served last on that port yields. Keyed by out_port, updated only
         # when that port actually grants a flit.
         self._rr_last_served: dict[int, int] = {}
+
+        # Flits popped from each input buffer during the current evaluate
+        # phase. Added back in can_receive() so credit checks see the
+        # start-of-cycle occupancy (RTL: registered count < depth),
+        # independent of the order in which routers are evaluated.
+        self._pops: dict[tuple[int, int], int] = {
+            (p, vc): 0 for p in ALL_PORTS for vc in (VC0, VC1)
+        }
+
+        # (out_port, out_vc) locks held at the start of the current cycle.
+        # A lock released by a Tail is re-grantable only in the next cycle.
+        self._locks_at_start: frozenset[tuple[int, int]] = frozenset()
+
         self.outgoing_links: dict[int, tuple[NoCRouter, int]] = {}
 
         # Staging slot for outgoing flits in 2-phase simulation: out_port -> (neighbor, in_port, flit)
@@ -124,8 +137,14 @@ class NoCRouter:
         self.outgoing_links[out_port] = (neighbor, in_port)
 
     def can_receive(self, in_port: int, vc_id: int) -> bool:
-        """Check if the given input buffer has space."""
-        return len(self.in_buffers[(in_port, vc_id)]) < self.buffer_depth
+        """Start-of-cycle credit check for the given input buffer.
+
+        Pops already made by this router in the current evaluate phase are
+        counted back, so a sender sees the same answer whether this router
+        evaluated before or after it (RTL: registered occupancy < depth).
+        """
+        key = (in_port, vc_id)
+        return len(self.in_buffers[key]) + self._pops[key] < self.buffer_depth
 
     def receive_flit(self, in_port: int, flit: int) -> bool:
         """Receive a flit into the appropriate (in_port, vc) buffer."""
@@ -141,11 +160,20 @@ class NoCRouter:
         buf.append(flit)
         return True
 
-    def _desired_link(self, in_port: int, vc: int) -> int | None:
-        """Side-effect-free probe: the physical link this channel wants now.
+    def _pop(self, in_port: int, vc: int) -> int:
+        self._pops[(in_port, vc)] += 1
+        return self.in_buffers[(in_port, vc)].popleft()
 
-        Returns None when the head flit needs no inter-router link (eject,
-        chained-header drop, self-releasing lone header, empty buffer).
+    def _lock_free(self, key: tuple[int, int]) -> bool:
+        """A lock is grantable only if it was free at the start of the cycle
+        and nobody acquired it earlier in this cycle."""
+        return key not in self._locks_at_start and key not in self.crossbar_locks
+
+    def _request(self, in_port: int, vc: int) -> tuple[int, int] | None:
+        """Side-effect-free probe: the (out_port, out_vc) this channel's head
+        flit competes for this cycle. PORT_LOCAL (ejection) is a port like any
+        other. Returns None for an empty buffer, a chained-header drop, a
+        self-releasing lone header, or a protocol error (raised later).
         """
         buf = self.in_buffers[(in_port, vc)]
         if not buf:
@@ -157,69 +185,76 @@ class NoCRouter:
         if lock is not None:
             if flit_type == FLIT_TYPE_HEADER and lock.out_port == PORT_LOCAL:
                 return None
-            return None if lock.out_port == PORT_LOCAL else lock.out_port
+            return (lock.out_port, lock.out_vc)
 
         if flit_type == FLIT_TYPE_HEADER:
             decision = router_step(flit)
-            if decision.action == "forward" and decision.out_port != PORT_LOCAL:
-                return decision.out_port
-            return None
+            if decision.action == "chain":
+                return None
+            if decision.action == "eject":
+                return (PORT_LOCAL, decision.vc_id)
+            assert decision.out_port is not None
+            return (decision.out_port, decision.vc_id)
         if flit_type == FLIT_TYPE_SINGLE_AER:
             if (flit >> 26) & 0b11 == 0:
-                return None
-            port = (flit >> 20) & 0b111
-            return None if port == PORT_LOCAL else port
+                return (PORT_LOCAL, VC0)
+            return ((flit >> 20) & 0b111, VC0)
         return None
 
     def _arbitration_order(self) -> list[tuple[int, int]]:
-        """Order input channels so each physical link is offered first to its
+        """Order input channels so each output port is offered first to its
         round-robin winner.
 
-        For a link wanted by channels of both VC classes, the class served
-        last on that link goes second. Within one class, lower input port
-        index goes first (fixed priority). Channels that need no link
-        (eject/chain) are appended afterwards. The order is a pure function
-        of buffer state and the per-port RR pointers, so it does not depend
-        on dict or loop iteration history.
+        Requests are grouped by output port. Within a port, channels whose
+        requested out_vc differs from the class served last on that port go
+        first; ties are broken by (in_port, in_vc) ascending. Channels with no
+        port request (chain drop, self-release) are appended afterwards; they
+        touch no shared resource. The order is a pure function of buffer
+        state, locks, and the per-port RR pointers.
         """
-        wants: dict[int, list[tuple[int, int]]] = {}
-        for in_port in ALL_PORTS:
+        wants: dict[int, list[tuple[int, int, int]]] = {}
+        for in_port in sorted(ALL_PORTS):
             for vc in (VC0, VC1):
-                link = self._desired_link(in_port, vc)
-                if link is not None:
-                    wants.setdefault(link, []).append((in_port, vc))
+                req = self._request(in_port, vc)
+                if req is not None:
+                    wants.setdefault(req[0], []).append((in_port, vc, req[1]))
 
         order: list[tuple[int, int]] = []
         for out_port in sorted(wants):
-            last = self._rr_last_served.get(out_port, VC0)  # VC1 first on fresh links
+            last = self._rr_last_served.get(out_port, VC0)  # VC1 first on fresh ports
             cands = wants[out_port]
-            # Class that did NOT win last time goes first, then the other class.
-            first_cls = [c for c in cands if c[1] != last]
-            second_cls = [c for c in cands if c[1] == last]
-            order.extend(first_cls + second_cls)
+            order.extend((p, v) for p, v, ovc in cands if ovc != last)
+            order.extend((p, v) for p, v, ovc in cands if ovc == last)
 
         seen = set(order)
-        for in_port in ALL_PORTS:
+        for in_port in sorted(ALL_PORTS):
             for vc in (VC0, VC1):
                 if (in_port, vc) not in seen and self.in_buffers[(in_port, vc)]:
                     order.append((in_port, vc))
         return order
 
     def evaluate_cycle(self) -> None:
-        """Phase 1: Evaluate inputs, arbitrate physical links, and stage outgoing flits.
+        """Phase 1: Evaluate inputs, arbitrate output ports, and stage outgoing flits.
 
-        Arbitration contract (normative for the RTL as well):
-          - At most one flit crosses each physical output link per cycle.
-          - Per-link round-robin between VC classes: the class that last won
-            a link yields to the other class on that link. The pointer is per
-            output port and only moves when that port grants a flit.
-          - Within a VC class, lower input-port index has priority.
-          - A (out_port, out_vc) lock released by a Tail this cycle can be
-            granted to another header in the SAME cycle only if that header
-            is ordered after the releasing channel; otherwise next cycle.
+        Arbitration contract (normative; the SpinalHDL OraRouter implements
+        the same rules):
+          - Every decision uses start-of-cycle state: buffer heads, locks
+            held at cycle start, and downstream occupancy (credits).
+          - Each output port, including PORT_LOCAL (ejection), grants at
+            most one flit per cycle.
+          - Per-port round-robin between VC classes (by requested out_vc):
+            the class that last won a port yields on that port. The pointer
+            moves only when that port grants a flit.
+          - Within a class, lower (in_port, in_vc) wins.
+          - A lock released by a Tail this cycle is re-grantable next cycle.
+          - A lone header that ejected locally keeps its (LOCAL, vc) lock
+            until the channel's next header arrives; that cycle only releases
+            the lock, and the new header is processed in the following cycle.
+          - Chained-header drops consume no port and happen unconditionally.
         """
         self.staged_tx.clear()
         link_used: dict[int, bool] = {p: False for p in ALL_PORTS}
+        self._locks_at_start = frozenset(self.crossbar_locks)
 
         for in_port, vc in self._arbitration_order():
             buf = self.in_buffers[(in_port, vc)]
@@ -231,162 +266,129 @@ class NoCRouter:
 
             if active_lock is not None:
                 if flit_type == FLIT_TYPE_HEADER and active_lock.out_port == PORT_LOCAL:
-                    # Self-releasing: previous lone header ejected to local NI has finished
+                    # Self-release of a lone ejected header; no grant this cycle
                     self._release_lock(active_lock)
-                    active_lock = None
+                    continue
 
-            if active_lock is not None:
-                # ACTIVE: stream following flit through the locked path
+                # ACTIVE: stream the next flit through the locked path
                 out_port = active_lock.out_port
                 out_vc = active_lock.out_vc
+                if link_used[out_port]:
+                    continue  # Port already granted to another channel this cycle
 
+                rewritten = (flit & ~(0b11 << 28)) | (out_vc << 28)
                 if out_port == PORT_LOCAL:
-                    buf.popleft()
-                    self.ejection_queue.append(flit)
+                    self._pop(in_port, vc)
+                    self.ejection_queue.append(rewritten)
                     self.ejected_flits += 1
-                    if flit_type == FLIT_TYPE_TAIL:
-                        self._release_lock(active_lock)
                 else:
-                    if link_used[out_port]:
-                        continue  # Physical link already occupied this cycle
-
                     neighbor, nbr_port = self.outgoing_links[out_port]
                     if not neighbor.can_receive(nbr_port, out_vc):
                         continue  # Downstream buffer full (backpressure)
-
-                    buf.popleft()
-                    rewritten = (flit & ~(0b11 << 28)) | (out_vc << 28)
+                    self._pop(in_port, vc)
                     self.staged_tx[out_port] = (neighbor, nbr_port, rewritten)
-                    link_used[out_port] = True
                     self.forwarded_flits += 1
-                    self._rr_last_served[out_port] = out_vc
 
-                    if flit_type == FLIT_TYPE_TAIL:
-                        self._release_lock(active_lock)
+                link_used[out_port] = True
+                self._rr_last_served[out_port] = out_vc
+                if flit_type == FLIT_TYPE_TAIL:
+                    self._release_lock(active_lock)
 
             else:
                 # IDLE: expects Header or Single-AER
                 if flit_type == FLIT_TYPE_HEADER:
-                    self._stage_header(in_port, vc, buf, link_used)
+                    self._stage_header(in_port, vc, link_used)
                 elif flit_type == FLIT_TYPE_SINGLE_AER:
-                    self._stage_aer(in_port, buf, link_used)
+                    self._stage_aer(in_port, link_used)
                 else:
                     raise RouterError(
                         f"Router {self.tile_id}: unexpected flit type {flit_type:02b} on IDLE channel"
                     )
 
-    def _stage_header(
-        self, in_port: int, vc: int, buf: deque[int], link_used: dict[int, bool]
-    ) -> None:
-        word = buf[0]
+    def _stage_header(self, in_port: int, vc: int, link_used: dict[int, bool]) -> None:
+        word = self.in_buffers[(in_port, vc)][0]
         decision = router_step(word)
 
         if decision.action == "chain":
-            # Chained Header: drop spent header at hop 0!
-            buf.popleft()
+            # Chained Header: drop the spent header; the successor header is
+            # evaluated at this router from the next cycle on.
+            self._pop(in_port, vc)
             self.chained_headers_dropped += 1
-            # Next flit remains at head of buffer to be evaluated in IDLE state
             return
 
         if decision.action == "eject":
-            if (PORT_LOCAL, decision.vc_id) in self.crossbar_locks:
-                return  # Local ejection VC is busy: stall the header
-            buf.popleft()
-            self.ejection_queue.append(word)
-            self.ejected_flits += 1
-            # Establish wormhole lock to PORT_LOCAL for subsequent body/tail flits
-            lock = CrossbarLock(in_port, vc, PORT_LOCAL, decision.vc_id)
-            self.crossbar_locks[(PORT_LOCAL, decision.vc_id)] = lock
-            self.channel_locks[(in_port, vc)] = lock
-            return
+            out_port, out_vc, out_word = PORT_LOCAL, decision.vc_id, word
+        else:
+            assert decision.out_port is not None and decision.word is not None
+            out_port, out_vc, out_word = decision.out_port, decision.vc_id, decision.word
 
-        # Forward action
-        out_port = decision.out_port
-        assert out_port is not None
-        out_vc = decision.vc_id
-
-        if decision.vc_id == VC1 and vc == VC0:
-            self.promotions_executed += 1
+        if not self._lock_free((out_port, out_vc)):
+            return  # This (port, VC) path is occupied by another wormhole
+        if link_used[out_port]:
+            return  # Port already granted this cycle
 
         if out_port == PORT_LOCAL:
-            buf.popleft()
-            assert decision.word is not None
-            self.ejection_queue.append(decision.word)
+            self._pop(in_port, vc)
+            self.ejection_queue.append(out_word)
             self.ejected_flits += 1
-            lock = CrossbarLock(in_port, vc, PORT_LOCAL, out_vc)
-            self.crossbar_locks[(PORT_LOCAL, out_vc)] = lock
-            self.channel_locks[(in_port, vc)] = lock
-            return
-        # Check (out_port, out_vc) lock availability
-        if (out_port, out_vc) in self.crossbar_locks:
-            return  # This VC path is currently occupied by another wormhole!
+        else:
+            if out_port not in self.outgoing_links:
+                raise RouterError(f"Router {self.tile_id}: no link attached to port {out_port}")
+            neighbor, nbr_port = self.outgoing_links[out_port]
+            if not neighbor.can_receive(nbr_port, out_vc):
+                return  # Downstream buffer full
+            self._pop(in_port, vc)
+            self.staged_tx[out_port] = (neighbor, nbr_port, out_word)
+            self.forwarded_flits += 1
 
-        if link_used[out_port]:
-            return  # Physical link already carrying a flit from another VC this cycle!
+        if out_vc == VC1 and vc == VC0:
+            self.promotions_executed += 1
 
-        if out_port not in self.outgoing_links:
-            raise RouterError(f"Router {self.tile_id}: no link attached to port {out_port}")
-
-        neighbor, nbr_port = self.outgoing_links[out_port]
-        if not neighbor.can_receive(nbr_port, out_vc):
-            return  # Downstream buffer full
-
-        # Acquire lock and stage header
-        buf.popleft()
         lock = CrossbarLock(in_port, vc, out_port, out_vc)
         self.crossbar_locks[(out_port, out_vc)] = lock
         self.channel_locks[(in_port, vc)] = lock
-
-        assert decision.word is not None
-        self.staged_tx[out_port] = (neighbor, nbr_port, decision.word)
         link_used[out_port] = True
-        self.forwarded_flits += 1
         self._rr_last_served[out_port] = out_vc
 
-    def _stage_aer(self, in_port: int, buf: deque[int], link_used: dict[int, bool]) -> None:
-        word = buf[0]
+    def _stage_aer(self, in_port: int, link_used: dict[int, bool]) -> None:
+        word = self.in_buffers[(in_port, VC0)][0]
         hop_count = (word >> 26) & 0b11
         neuron_addr = word & 0xFFFFF
 
         if hop_count == 0:
-            buf.popleft()
-            self.ejection_queue.append(word)
-            self.ejected_flits += 1
-            return
+            out_port, out_word = PORT_LOCAL, word
+        else:
+            out_port = (word >> 20) & 0b111
+            second_hop = (word >> 23) & 0b111
+            out_word = (
+                (FLIT_TYPE_SINGLE_AER << 30)
+                | (VC0 << 28)
+                | ((hop_count - 1) << 26)
+                | (second_hop << 20)
+                | neuron_addr
+            )
 
-        out_port = (word >> 20) & 0b111
-        new_hop = hop_count - 1
-        second_hop = (word >> 23) & 0b111
-        new_word = (
-            (FLIT_TYPE_SINGLE_AER << 30)
-            | (VC0 << 28)
-            | (new_hop << 26)
-            | (second_hop << 20)
-            | neuron_addr
-        )
-
-        if out_port == PORT_LOCAL:
-            buf.popleft()
-            self.ejection_queue.append(new_word)
-            self.ejected_flits += 1
-            return
-
-        if (out_port, VC0) in self.crossbar_locks:
+        # AER shares the VC0 class: it must not interleave into a VC0 wormhole
+        if not self._lock_free((out_port, VC0)):
             return
         if link_used[out_port]:
             return
 
-        if out_port not in self.outgoing_links:
-            raise RouterError(f"Router {self.tile_id}: no link attached for AER port {out_port}")
+        if out_port == PORT_LOCAL:
+            self._pop(in_port, VC0)
+            self.ejection_queue.append(out_word)
+            self.ejected_flits += 1
+        else:
+            if out_port not in self.outgoing_links:
+                raise RouterError(f"Router {self.tile_id}: no link attached for AER port {out_port}")
+            neighbor, nbr_port = self.outgoing_links[out_port]
+            if not neighbor.can_receive(nbr_port, VC0):
+                return
+            self._pop(in_port, VC0)
+            self.staged_tx[out_port] = (neighbor, nbr_port, out_word)
+            self.forwarded_flits += 1
 
-        neighbor, nbr_port = self.outgoing_links[out_port]
-        if not neighbor.can_receive(nbr_port, VC0):
-            return
-
-        buf.popleft()
-        self.staged_tx[out_port] = (neighbor, nbr_port, new_word)
         link_used[out_port] = True
-        self.forwarded_flits += 1
         self._rr_last_served[out_port] = VC0
 
     def commit_cycle(self) -> int:
@@ -396,6 +398,8 @@ class NoCRouter:
             neighbor.receive_flit(nbr_port, flit)
             committed += 1
         self.staged_tx.clear()
+        for key in self._pops:
+            self._pops[key] = 0
         return committed
 
     def _release_lock(self, lock: CrossbarLock) -> None:
@@ -443,7 +447,10 @@ class NetworkInterface:
         self.tx_packet_queue: deque[Packet] = deque()
         self.tx_flit_queue: deque[int] = deque()
         self.rx_packets: list[Packet] = []
-        self._current_rx_flits: list[int] = []
+        # One reassembly buffer per VC: the single ejection port may
+        # interleave a VC0 and a VC1 wormhole flit by flit. Ejected stream
+        # flits carry their lock's VC in bits [29:28].
+        self._current_rx_flits: dict[int, list[int]] = {VC0: [], VC1: []}
 
     def send_packet(self, packet: Packet) -> None:
         self.tx_packet_queue.append(packet)
@@ -474,13 +481,14 @@ class NetworkInterface:
         while self.router.ejection_queue:
             flit = self.router.ejection_queue.popleft()
             flit_type = (flit >> 30) & 0b11
+            vc = (flit >> 28) & 0b11
             if flit_type == FLIT_TYPE_HEADER:
-                self._current_rx_flits = [flit]
+                self._current_rx_flits[vc] = [flit]
             elif flit_type == FLIT_TYPE_BODY:
-                self._current_rx_flits.append(flit)
+                self._current_rx_flits[vc].append(flit)
             elif flit_type == FLIT_TYPE_TAIL:
-                self._current_rx_flits.append(flit)
-                self._assemble_rx_packet()
+                self._current_rx_flits[vc].append(flit)
+                self._assemble_rx_packet(vc)
             elif flit_type == FLIT_TYPE_SINGLE_AER:
                 neuron_addr = flit & 0xFFFFF
                 aer_pkt = Packet(
@@ -488,10 +496,10 @@ class NetworkInterface:
                 )
                 self.rx_packets.append(aer_pkt)
 
-    def _assemble_rx_packet(self) -> None:
+    def _assemble_rx_packet(self, vc: int) -> None:
         headers = []
         payload = []
-        for f in self._current_rx_flits:
+        for f in self._current_rx_flits[vc]:
             ftype = (f >> 30) & 0b11
             if ftype == FLIT_TYPE_HEADER:
                 headers.append(f)
@@ -499,4 +507,4 @@ class NetworkInterface:
                 payload.append(f & 0xFFFFFFF)
         pkt = Packet(src_tile=-1, dst_tile=self.tile_id, headers=headers, payload=payload)
         self.rx_packets.append(pkt)
-        self._current_rx_flits = []
+        self._current_rx_flits[vc] = []
