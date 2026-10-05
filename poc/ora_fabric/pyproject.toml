@@ -1,0 +1,18 @@
+[project]
+name = "ora-fabric"
+version = "0.1.0"
+description = "ORA Virtual Fabric Executor & Elastic Core Simulator (PoC S1)"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    "ora-bitstream",
+]
+
+[tool.uv.sources]
+ora-bitstream = { path = "../ora_bitstream", editable = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ora_fabric"]
