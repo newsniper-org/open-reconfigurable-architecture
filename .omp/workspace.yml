@@ -1,0 +1,75 @@
+name: "ora"
+version: "1.1.1"
+
+modelsConfig: ".omp/models.yml"
+systemPrompt: ".omp/SYSTEM.md"
+
+defaultModel: "claude_opus_primary"
+
+planMode:
+  enabled: true
+  # planCreation normally runs on claude_fable_primary, but that model is
+  # currently failing and failoverRouting no longer lists it. A directly named
+  # model is not covered by failover, so it is switched here explicitly rather
+  # than left to fail. Restore by changing model back to claude_fable_primary.
+  planCreation:
+    model: "claude_opus_primary"
+    effort: "medium+ultracode"
+    workflows: ["architecture_review", "security_audit", "dependency_check"]
+  planExecution:
+    model: "claude_opus_primary"
+    effort: "high"
+    workflows: ["code_generation", "unit_testing"]
+
+cua:
+  enabled: true
+  scope:
+    allowShellExecution: true
+    allowScreenCapture: true
+    allowUIAutomation: true
+    allowedWindowTitles: []
+
+mcp:
+  enabled: true
+  servers:
+    local_filesystem:
+      command: "npx"
+      args: ["-y", "@modelcontextprotocol/server-filesystem", "./", "../shared_data"]
+
+security:
+  requireUserApproval: false
+  requiresApprovalCommands:
+    - "uv add"
+    - "uv remove"
+    - "uv pip"
+    - "podman rm"
+  allowedCommands:
+    - "uv"
+    - "just"
+    - "podman"
+    - "cat"
+    - "ls"
+    - "grep"
+    - "cargo"
+    - "curl"
+    - "jq"
+  privacyScanner:
+    enabled: true
+    # 아래 목록은 .omp/scripts/privacy_filter.py 의 SENSITIVE_PATTERNS 와
+    # 반드시 동일해야 합니다. 스크립트가 실행 가능한 기준이고 이 블록은 omp
+    # 런타임이 직접 읽는 사본입니다. 어긋나면 한쪽이 탐지한 값을 다른 쪽이
+    # 마스킹하지 못합니다. 검사: just verify-patterns
+    #
+    # 정규식은 이스케이프가 해석되지 않는 단일 인용 한 줄 스칼라로 적습니다.
+    # 내부의 작은따옴표만 두 번 반복합니다. 이전의 `|-` 블록 스칼라는 기계적
+    # 비교를 어렵게 만들어 사본 간 드리프트를 눈에 띄지 않게 했습니다.
+    patterns:
+      - '(?i)-----BEGIN[ A-Z]*PRIVATE KEY-----(?:.*?-----END[ A-Z]*PRIVATE KEY-----|.*)'
+      - '(?i)(api[_-]?key|secret|token|password)["''\s:=]+([A-Za-z0-9_\-]{16,})'
+      - '(?i)sk-[a-zA-Z0-9]{32,}'
+      - '(?i)ghp_[a-zA-Z0-9]{36}'
+
+crossProject:
+  ipcDirectories:
+    enabled: true
+    baseDir: "./"
