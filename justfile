@@ -252,3 +252,13 @@ mirror-local-replies-to recipient target:
         else \
             echo "⚠ $src/ empty or missing — nothing to mirror to {{target}}" ; \
         fi
+
+send-to-phone SRC DEV=`cat ../device-id.txt`:
+    kdeconnect-cli --device "{{DEV}}" --share "{{SRC}}"
+
+# Typst 문서를 PDF로 렌더링 후 스마트폰으로 일괄 전송
+send-docs-to-phone:
+    typst compile docs/ora_poc_standard_specification.typ docs/ora_poc_standard_specification.pdf
+    typst compile docs/ora_specification_typst_document.typ docs/ora_specification_typst_document.pdf
+    just send-to-phone docs/ora_poc_standard_specification.pdf
+    just send-to-phone docs/ora_specification_typst_document.pdf
