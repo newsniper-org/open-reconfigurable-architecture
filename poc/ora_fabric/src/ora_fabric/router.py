@@ -395,7 +395,10 @@ class NoCRouter:
         """Phase 2: Commit all staged flits to downstream input buffers."""
         committed = 0
         for _, (neighbor, nbr_port, flit) in self.staged_tx.items():
-            neighbor.receive_flit(nbr_port, flit)
+            if not neighbor.receive_flit(nbr_port, flit):
+                raise RouterError(
+                    f"Router {self.tile_id}: downstream neighbor {neighbor.tile_id} buffer overflow on port {nbr_port}"
+                )
             committed += 1
         self.staged_tx.clear()
         for key in self._pops:

@@ -185,7 +185,7 @@ ORA-N 패킷은 고정 32비트 단위의 플릿(Flit) 시퀀스로 구성되며
       current_hops = flit[27:25]                     // 잔여 홉
       trans_idx    = flit[23:21]                      // VC 승격 잔여 카운트
 
-      if current_hops == 0:                          // 1. 홉 소련 판정이 최우선
+      if current_hops == 0:                          // 1. 홉 소진 판정이 최우선
           if flit[24] == 1:                          //    Chained Header
               DropCurrentFlit()                      //    헤더 폐기; 다음 플릿은
               GotoNextFlitAsHeader()                 //    반드시 유형 2'b00 헤더
