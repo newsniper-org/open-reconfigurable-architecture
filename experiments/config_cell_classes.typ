@@ -198,7 +198,7 @@ TCCT/T-RAM(Nemati & Plummer)은 SOI 기반 박막 사이리스터 메모리로, 
 
 - *메커니즘의 원천이 사라진다:* Mn#sub[3]AN의 $sigma_z$는 Mn의 큰 국소 자기 모멘트가 만드는 비공선 반강자성 질서(클러스터 팔중극)에서 나온다. Ru는 4d 원소로 밴드가 넓고 원자 내 교환 에너지가 작아, 화합물에서 대개 국소 모멘트가 없는 상자성 금속이 된다. 질서가 없으면 T-odd $sigma_z$도 없다. SOC가 커져도 남는 것은 통상 스핀 홀 성분($sigma_y$)뿐이고, 그렇다면 Pt, W 같은 기존 중금속과 다를 바가 없다.
 - *사례:* RuO#sub[2]는 알터자성체의 대표 사례로 거론되었으나, μSR 측정에서 벌크 단결정의 정렬 모멘트 상한이 약 $10^(-4) mu_B$ 수준으로 나와 자기 질서가 없다는 보고가 나왔다(Hiraishi et al., PRL 132, 166702 (2024), #link("https://arxiv.org/abs/2403.10028")[arXiv:2403.10028]\; Keßler et al., npj Spintronics 2, 50 (2024), #link("https://arxiv.org/abs/2405.10820")[arXiv:2405.10820]). Ru 화합물에서 자기 질서를 기대하기 어렵다는 경계 사례다.
-- *합성:* Ru#sub[3]AN 안티페로브스카이트의 합성 보고는 찾지 못했다. Ru는 질화물을 잘 만들지 않는 귀금속 계열이며, Ru 질화물은 고압에서만 안정하다는 이론 예측이 있다(Sci. Rep. 6, 33506 (2016), #link("https://www.nature.com/articles/srep33506")[Nature]). 저온 BEOL 박막 공정과는 정반대 조건이다.
+- *합성:* Ru#sub[3]AN 안티페로브스카이트의 합성 보고는 찾지 못했다. Ru 이원 질화물의 경우, 열역학적으로 안정한 상(예: RuN#sub[2])은 고압이 필요하다는 DFT 예측과 고압 합성 보고가 있다(Sci. Rep. 6, 33506 (2016), #link("https://www.nature.com/articles/srep33506")[Nature]). 반면 준안정 RuN 박막은 저온에서 만들어진 바 있다. NaCl형은 반응성 펄스 레이저 증착으로(Moreno-Armenta et al., J. Phys. Chem. Solids 68, 1989 (2007)), ZnS형은 약 50 °C 펄스 DC 반응성 스퍼터링으로(Bouhtiyya et al., Scripta Mater. 68, 659 (2013)) 보고되었다. 즉 저온 박막 공정으로 Ru 질화물 자체는 만들 수 있지만 준안정상이며, 이 사실은 Ru#sub[3]AN 안티페로브스카이트의 형성 가능성이나 BEOL 열 예산(≤400 °C)에서의 안정성에 대해서는 아무것도 말해주지 않는다.
 
 *검토할 가치가 있는 변형*
 
